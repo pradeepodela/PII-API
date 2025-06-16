@@ -1,49 +1,26 @@
-# app.py
 import os
 import json
 import logging
+import requests
 from typing import Dict, List, Union
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-from waitress import serve
-from gliner import GLiNER
-
-# API Configuration
-PORT=5000
-FLASK_ENV='production'
-
-# Optional: Set log level (DEBUG, INFO, WARNING, ERROR, CRITICAL)
-LOG_LEVEL='INFO'
-
-# Optional: Set maximum request size (in MB)
-MAX_CONTENT_LENGTH=10
-
-# Optional: Set model name
-MODEL_NAME='urchade/gliner_multi_pii-v1'
-
 
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.StreamHandler(),
-        logging.FileHandler("pii_api.log")
-    ]
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
 
 # Initialize Flask app
 app = Flask(__name__)
-CORS(app)  # Enable CORS for all routes
+CORS(app)
 
-# Load GLiNER model
-try:
-    MODEL = GLiNER.from_pretrained("urchade/gliner_multi_pii-v1")
-    logger.info("GLiNER model loaded successfully")
-except Exception as e:
-    logger.error(f"Failed to load GLiNER model: {str(e)}")
-    raise
+# Hugging Face configuration
+HF_API_TOKEN = os.environ.get('HF_API_TOKEN')  # Set this in Vercel environment variables
+HF_MODEL = "urchade/gliner_multi_pii-v1"
+HF_API_URL = f"https://api-inference.huggingface.co/models/{HF_MODEL}"
 
 # Default PII labels
 DEFAULT_LABELS = [
@@ -54,87 +31,80 @@ DEFAULT_LABELS = [
     "employee ID number", "tax ID number", "full address", "personally identifiable information"
 ]
 
+def query_huggingface(text: str, labels: List[str], threshold: float = 0.5):
+    """Query Hugging Face Inference API"""
+    headers = {"Authorization": f"Bearer {HF_API_TOKEN}"}
+    
+    payload = {
+        "inputs": text,
+        "parameters": {
+            "labels": labels,
+            "threshold": threshold
+        }
+    }
+    
+    response = requests.post(HF_API_URL, headers=headers, json=payload)
+    
+    if response.status_code == 200:
+        return response.json()
+    else:
+        raise Exception(f"HF API Error: {response.status_code} - {response.text}")
+
 @app.route('/health', methods=['GET'])
 def health_check():
-    """Health check endpoint to verify API status"""
-    return jsonify({"status": "healthy", "model": "GLiNER PII Extractor"}), 200
+    """Health check endpoint"""
+    return jsonify({"status": "healthy", "model": "GLiNER PII Extractor (HF API)"}), 200
 
 @app.route('/api/extract', methods=['POST'])
 def extract_pii():
-    """
-    Extract PII entities from provided text
-    
-    Request body:
-    {
-        "text": "Text containing PII to analyze",
-        "labels": "comma,separated,labels" (optional),
-        "threshold": 0.5 (optional),
-        "nested_ner": false (optional)
-    }
-    """
+    """Extract PII entities from provided text using Hugging Face API"""
     try:
-        # Get request data
         data = request.get_json()
         
         if not data:
             return jsonify({"error": "No JSON data provided"}), 400
         
-        # Get required parameters
         text = data.get('text')
         if not text:
             return jsonify({"error": "No text provided"}), 400
         
-        # Get optional parameters with defaults
         labels_str = data.get('labels')
         threshold = float(data.get('threshold', 0.5))
-        nested_ner = bool(data.get('nested_ner', False))
         
-        # Process labels
         if labels_str:
             labels = [label.strip() for label in labels_str.split(',')]
         else:
             labels = DEFAULT_LABELS
             
-        # Validate threshold
         if not 0 <= threshold <= 1:
             return jsonify({"error": "Threshold must be between 0 and 1"}), 400
             
-        # Log request details
-        logger.info(f"Processing PII extraction request: {len(text)} chars, {len(labels)} labels, threshold={threshold}")
+        logger.info(f"Processing PII extraction: {len(text)} chars, {len(labels)} labels")
         
-        # Extract entities
-        entities = MODEL.predict_entities(
-            text, 
-            labels, 
-            flat_ner=not nested_ner, 
-            threshold=threshold
-        )
+        # Query Hugging Face API
+        hf_result = query_huggingface(text, labels, threshold)
         
-        # Format results
+        # Format results to match original API
         results = {
             "text": text,
             "entities": [
                 {
-                    "entity": entity["label"],
-                    "word": entity["text"],
-                    "start": entity["start"],
-                    "end": entity["end"],
+                    "entity": entity.get("entity_group", entity.get("label", "")),
+                    "word": entity.get("word", ""),
+                    "start": entity.get("start", 0),
+                    "end": entity.get("end", 0),
                     "score": float(entity.get("score", 0)),
                 }
-                for entity in entities
+                for entity in hf_result
             ],
         }
         
         logger.info(f"PII extraction completed: {len(results['entities'])} entities found")
-        
         return jsonify(results), 200
         
-    except json.JSONDecodeError:
-        logger.error("Invalid JSON in request")
-        return jsonify({"error": "Invalid JSON"}), 400
     except Exception as e:
         logger.error(f"Error processing request: {str(e)}")
-        return jsonify({"error": "Internal server error"}), 500
+        return jsonify({"error": str(e)}), 500
 
 @app.errorhandler(404)
 def not_found(e):
@@ -148,4 +118,3 @@ def method_not_allowed(e):
 def server_error(e):
     logger.error(f"Server error: {str(e)}")
     return jsonify({"error": "Internal server error"}), 500
-
