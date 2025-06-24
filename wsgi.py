@@ -1,4 +1,4 @@
 from app import app
-# This is the WSGI application that Vercel will use
-if __name__ == "__main__":
-    app.run()
+if __name__ == '__main__':
+    # When running locally, disable OAuthlib's HTTPS verification
+    app.run(debug=True)
